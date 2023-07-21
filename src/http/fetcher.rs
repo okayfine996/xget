@@ -1,11 +1,13 @@
 use std::fs::File;
 use std::io;
+use std::ops::Index;
 use std::os::unix::prelude::FileExt;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE};
-use reqwest::{Error, StatusCode};
+use reqwest::{Error, StatusCode, Url};
 use threadpool::ThreadPool;
+use regex::Regex;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChunkState {
@@ -59,7 +61,7 @@ impl Fetcher {
     }
 }
 
-const CHUNK_SIZE: u32 = 4096;
+const CHUNK_SIZE: u32 = 40960000;
 
 impl Fetcher {
     pub fn resolve(&mut self) -> Result<(), Error> {
@@ -76,17 +78,33 @@ impl Fetcher {
         }
 
 
-        let mut fileName: String;
+        let mut fileName = String::new();
+
+        println!("{:?}", result);
 
         if let op = result.headers().get(CONTENT_DISPOSITION) {
             if op.is_some() {
-                fileName = op.unwrap().to_str().unwrap().to_string();
+                let str = op.unwrap().to_str().unwrap().to_string();
+                for str in str.split(';') {
+                    if str.contains("filename") {
+                        fileName = str.split('=').next().unwrap().to_string();
+                        break
+                    }
+                }
+
             }
-        } else {
-            fileName = self.url.clone();
         }
 
-        let mut file = File::create("test.aa").unwrap();
+        if fileName == "" {
+            if let Some(file) = extract_filename_from_url(&self.url) {
+               fileName = file;
+            }else {
+                fileName = "unknown".to_string();
+            }
+        }
+
+
+        let mut file = File::create(fileName).unwrap();
         let _ = file.set_len(content_size);
 
         self.output = Some(Arc::new(Mutex::new(file)));
@@ -98,7 +116,7 @@ impl Fetcher {
 
     pub fn start_download(&self) {
 
-        let thread_pool = ThreadPool::new(4);
+        let thread_pool = ThreadPool::new(32);
 
         for chunk in self.chunks.clone() {
             let file = self.output.clone().unwrap().clone();
@@ -120,6 +138,22 @@ impl Fetcher {
 
         thread_pool.join();
     }
+}
+
+fn extract_filename_from_url(url: &str) -> Option<String> {
+    // Parse the URL
+    let parsed_url = Url::parse(url).ok()?;
+
+    // Get the path component of the URL
+    let path = parsed_url.path();
+
+    // Use a regular expression to extract the filename
+    let re = Regex::new(r"/([^/]+)$").unwrap();
+    if let Some(captures) = re.captures(path) {
+        return captures.get(1).map(|m| m.as_str().to_string());
+    }
+
+    None
 }
 
 
@@ -150,6 +184,8 @@ pub fn split_chunk(content_size: u64, chunk_size: u64) -> Vec<Arc<Chunk>> {
 
     chunks
 }
+
+
 
 fn create_fixed_size_file(file: String, fixed_size: u64) -> Result<File, std::io::Error> {
     let mut file = File::create(file)?;
