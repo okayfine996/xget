@@ -1,11 +1,17 @@
 use std::fs::File;
-use std::io;
-use std::ops::Index;
+use std::{error, io, thread};
+use std::cell::RefCell;
+use std::io::{Error, Read};
+use std::ops::{Deref, Index};
 use std::os::unix::prelude::FileExt;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use indicatif::{ProgressBar, ProgressStyle};
+use log::{debug, trace};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE};
-use reqwest::{Error, StatusCode, Url};
+use reqwest::{StatusCode, Url};
 use threadpool::ThreadPool;
 use regex::Regex;
 
@@ -22,6 +28,8 @@ pub struct Chunk {
     pub state: ChunkState,
     pub begin: u64,
     pub end: u64,
+    pub downloaded: u64,
+    pub data: Vec<u8>,
 }
 
 impl Chunk {
@@ -30,6 +38,8 @@ impl Chunk {
             state: ChunkState::WaitStart,
             begin,
             end,
+            downloaded: 0,
+            data: Vec::new(),
         }
     }
 }
@@ -43,20 +53,30 @@ enum FetcherState {
     Failed,
 }
 
-struct Fetcher {
+pub struct Fetcher {
     state: FetcherState,
-    chunks: Vec<Arc<Chunk>>,
-    output: Option<Arc<Mutex<File>>>,
+    chunks: Vec<Arc<Mutex<Chunk>>>,
+    output_path: Option<String>,
+    file: Option<Arc<Mutex<File>>>,
     url: String,
+    connections: usize,
+    share_data: Arc<Mutex<SharedData>>,
+    downloaded_count: AtomicU64,
 }
 
+static counter: AtomicU64 = AtomicU64::new(0);
+
 impl Fetcher {
-    pub fn new(url: String) -> Fetcher {
+    pub fn new(url: String, output: Option<String>, connections: Option<usize>, share_data: Arc<Mutex<SharedData>>) -> Fetcher {
         Fetcher {
             state: FetcherState::WaitStart,
             chunks: vec![],
-            output: None,
+            output_path: output,
+            connections: connections.unwrap_or(num_cpus::get()),
             url,
+            file: None,
+            share_data: share_data,
+            downloaded_count: AtomicU64::new(0),
         }
     }
 }
@@ -64,81 +84,158 @@ impl Fetcher {
 const CHUNK_SIZE: u32 = 40960000;
 
 impl Fetcher {
-    pub fn resolve(&mut self) -> Result<(), Error> {
+    pub fn resolve(&mut self) -> Result<(), reqwest::Error> {
         let client = reqwest::blocking::Client::new();
         let result = client.get(&self.url).header(RANGE, 0).send()?;
 
         let content_size = result.headers().get(CONTENT_LENGTH).unwrap()
             .to_str().unwrap().parse::<u64>().unwrap();
-        // support chunk
-        if result.status().as_u16() == 206 || result.headers().get(ACCEPT_RANGES).unwrap().to_str().unwrap().contains("bytes") {
-            self.chunks = split_chunk(content_size, CHUNK_SIZE as u64);
-        } else {
-            self.chunks.push(Arc::new(Chunk::new(0, content_size - 1)));
-        }
 
+        // check support chunk
+        if result.status().as_u16() == 206 || result.headers().get(ACCEPT_RANGES).unwrap().to_str().unwrap().contains("bytes") {
+            for x in split_chunk(content_size, 16).into_iter() {
+                self.chunks.push(Arc::new(Mutex::new(x)));
+            }
+        } else {
+            self.chunks.push(Arc::new(Mutex::new(Chunk::new(0, content_size - 1))));
+        }
 
         let mut fileName = String::new();
-
-        println!("{:?}", result);
-
-        if let op = result.headers().get(CONTENT_DISPOSITION) {
-            if op.is_some() {
-                let str = op.unwrap().to_str().unwrap().to_string();
-                for str in str.split(';') {
-                    if str.contains("filename") {
-                        fileName = str.split('=').next().unwrap().to_string();
-                        break
+        if self.output_path.is_none() {
+            debug!("{:?}", result);
+            if let op = result.headers().get(CONTENT_DISPOSITION) {
+                if op.is_some() {
+                    let str = op.unwrap().to_str().unwrap().to_string();
+                    for str in str.split(';') {
+                        if str.contains("filename") {
+                            fileName = str.split('=').next().unwrap().to_string();
+                            break;
+                        }
                     }
                 }
+            }
 
+            if fileName == "" {
+                if let Some(file) = extract_filename_from_url(&self.url) {
+                    fileName = file;
+                } else {
+                    fileName = "unknown".to_string();
+                }
             }
         }
-
-        if fileName == "" {
-            if let Some(file) = extract_filename_from_url(&self.url) {
-               fileName = file;
-            }else {
-                fileName = "unknown".to_string();
-            }
-        }
-
 
         let mut file = File::create(fileName).unwrap();
         let _ = file.set_len(content_size);
 
-        self.output = Some(Arc::new(Mutex::new(file)));
+        self.file = Some(Arc::new(Mutex::new(file)));
 
         Ok(())
     }
 
 
-
     pub fn start_download(&self) {
-
-        let thread_pool = ThreadPool::new(32);
-
-        for chunk in self.chunks.clone() {
-            let file = self.output.clone().unwrap().clone();
+        let mut handlers = vec![];
+        for i in 0..self.chunks.len() {
             let url = self.url.clone();
-            thread_pool.execute(move || {
-                let client = reqwest::blocking::Client::new();
-                let result = client.get(url).header(RANGE, format!("bytes={}-{}", chunk.begin, chunk.end)).send();
+            let output = self.file.clone().unwrap().clone();
+            let chunk = self.chunks[i].clone();
+            let share_data = self.share_data.clone();
+            let handler = thread::spawn(|| {
+                fetch_chunk(chunk, url, output, share_data);
+            });
 
-                match result {
-                    Ok(result) => {
-                        let bytes = result.bytes().unwrap();
-                        let mut file = file.lock().unwrap();
-                        let _ = file.write_all_at(bytes.as_ref(), chunk.begin);
-                    }
-                    Err(_) => {}
-                }
-            })
+            handlers.push(handler);
         }
 
-        thread_pool.join();
+        let mut content_size = 0;
+        {
+            content_size = self.file.clone().unwrap().lock().unwrap().metadata().unwrap().len();
+        }
+
+        thread::spawn(move || {
+            let pb = ProgressBar::new(content_size);
+            let style = ProgressStyle::default_bar().template("[{elapsed_precise}] {bar:40}  {bytes_per_sec} {percent}% {bytes}").unwrap().progress_chars("##-");
+            pb.set_style(style);
+
+
+            let mut last_progress = 0;
+            loop {
+                let new = counter.load(Ordering::Relaxed);
+                let delta = new - last_progress;
+                pb.inc(delta);
+                last_progress = new;
+                thread::sleep_ms(100)
+            }
+        });
+
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut data = self.share_data.lock().unwrap();
+        data.exit_flag = true;
     }
 }
+
+fn fetch_chunk(chunk: Arc<Mutex<Chunk>>, url: String, output: Arc<Mutex<File>>, share_data: Arc<Mutex<SharedData>>) -> Result<(), Error> {
+    let mut chunk = chunk.lock().unwrap();
+
+    if chunk.state == ChunkState::Completed {
+        return Ok(());
+    }
+
+    let client = reqwest::blocking::Client::new();
+    // Try five times if there some thing wrong
+    for i in 0..5 {
+        let request = client.get(&url).header(RANGE, format!("bytes={}-{}", chunk.begin + chunk.downloaded, chunk.end));
+        let mut result = request.send().unwrap();
+        if !result.status().is_success() {
+            thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+
+        // crate buffer
+        let mut buffer = vec![0; 4096];
+        let file = &mut output.lock().unwrap();
+        loop {
+            let offset = match result.read(&mut buffer) {
+                Ok(offset) => offset,
+                Err(_) => 0 as usize
+            };
+
+            if offset == 0 {
+                break;
+            }
+
+            let wirte_result = file.write_at(&buffer[0..offset], chunk.begin + chunk.downloaded);
+            if wirte_result.is_err() {
+                break;
+            }
+
+            debug!("wirte {} bytes to file", wirte_result.unwrap());
+            chunk.downloaded += offset as u64;
+            counter.fetch_add(offset as u64, Ordering::Relaxed);
+
+            let data = share_data.lock().unwrap();
+            if data.exit_flag {
+                return Ok(());
+            }
+        }
+
+        // Check chunk
+        if chunk.end - chunk.begin + 1 == chunk.downloaded {
+            println!("chunk {:?} download completed", &chunk);
+
+            chunk.state = ChunkState::Completed;
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 
 fn extract_filename_from_url(url: &str) -> Option<String> {
     // Parse the URL
@@ -157,34 +254,23 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
 }
 
 
-pub fn split_chunk(content_size: u64, chunk_size: u64) -> Vec<Arc<Chunk>> {
-    let mut chunks = Vec::with_capacity((content_size / chunk_size + 1) as usize);
+pub fn split_chunk(content_size: u64, connections: u64) -> Vec<Chunk> {
+    let mut chunks = Vec::with_capacity(connections as usize);
 
-    if content_size < chunk_size {
-        chunks.push(Arc::new(Chunk {
-            state: ChunkState::WaitStart,
-            begin: 0,
-            end: content_size,
-        }));
-    }
-
-    // the nums of chunk
-    let nums = content_size / chunk_size;
+    let chunk_size = content_size / connections;
 
     // split chunk
-    for i in 0..nums {
+    for i in 0..connections {
         let begin = i * chunk_size as u64;
-        let end = (i + 1) * chunk_size as u64 - 1;
-        chunks.push(Arc::new(Chunk::new(begin, end)));
-    }
-
-    if content_size % chunk_size != 0 {
-        chunks.push(Arc::new(Chunk::new(nums * chunk_size, content_size - 1)));
+        let mut end = (i + 1) * chunk_size as u64 - 1;
+        if i == connections - 1 {
+            end = content_size - 1
+        }
+        chunks.push(Chunk::new(begin, end));
     }
 
     chunks
 }
-
 
 
 fn create_fixed_size_file(file: String, fixed_size: u64) -> Result<File, std::io::Error> {
@@ -193,14 +279,19 @@ fn create_fixed_size_file(file: String, fixed_size: u64) -> Result<File, std::io
     Ok(file)
 }
 
+pub struct SharedData {
+    pub exit_flag: bool,
+}
+
 #[cfg(test)]
 mod test {
+    use std::sync::{Arc, Mutex};
     use crate::http::fetcher;
-    use crate::http::fetcher::{Chunk, create_fixed_size_file, Fetcher, split_chunk};
+    use crate::http::fetcher::{Chunk, create_fixed_size_file, Fetcher, SharedData, split_chunk};
 
     #[test]
     fn test_split_chunk() {
-        let result = split_chunk(1096, 256);
+        let result = split_chunk(1096, 5);
 
         let expect = vec![
             Chunk::new(0, 255),
@@ -208,6 +299,7 @@ mod test {
             Chunk::new(512, 767),
             Chunk::new(768, 1023),
             Chunk::new(1024, 1095)];
+
 
         // assert_eq!(result, expect)
     }
@@ -220,7 +312,8 @@ mod test {
 
     #[test]
     fn test_download() {
-        let mut fetcher = Fetcher::new("http://192.168.2.200:8080/go_admin.sql".to_string());
+        let mut fetcher = Fetcher::new("https://okg-pub-hk.oss-cn-hongkong.aliyuncs.com/cdn/okbc/snapshot/testnet-s0-20230720-2995040-rocksdb.tar.gz'".to_string(),
+                                       None, None, Arc::new(Mutex::new(SharedData { exit_flag: false })));
         let result = fetcher.resolve();
         fetcher.start_download();
     }

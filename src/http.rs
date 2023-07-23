@@ -1,2 +1,2 @@
 mod config;
-mod fetcher;
+pub mod fetcher;
