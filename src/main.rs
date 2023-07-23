@@ -1,24 +1,40 @@
 use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::mpsc::channel;
 use std::thread;
 use clap::Parser;
 use reqwest::Error;
 use xget::http;
-use xget::http::fetcher::{Fetcher, FetcherState, SharedData};
+use xget::http::fetcher;
+use xget::http::fetcher::{extract_filename_from_url, Fetcher, FetcherState, SharedData};
 
 fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
 
-    let shared_data = Arc::new(Mutex::new(SharedData { exit_flag: false }));
-    let mut fetcher = Fetcher::new(cli.url, cli.output, cli.connections);
-    match fetcher.resolve() {
-        Ok(_) => {}
-        Err(err) => panic!("{}", err)
+    let mut fetcher: Fetcher;
+
+    let url = cli.url.clone() + ".tmp";
+
+    let file = extract_filename_from_url(&url).unwrap();
+    if Path::new(file.as_str()).exists() {
+        let file = File::open(file).unwrap();
+        let reader = BufReader::new(file);
+        fetcher = serde_json::from_reader(reader).unwrap();
+    }else {
+        fetcher = Fetcher::new(cli.url, cli.output, cli.connections);
     }
 
+    let shared_data = Arc::new(Mutex::new(SharedData { exit_flag: false }));
+    if fetcher.state == FetcherState::WaitStart {
+        match fetcher.resolve() {
+            Ok(_) => {}
+            Err(err) => panic!("{}", err)
+        }
+    }
 
     let share_data = shared_data.clone();
     thread::spawn(move || {

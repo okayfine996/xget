@@ -63,6 +63,7 @@ pub struct Fetcher {
     pub content_size: u64,
     pub url: String,
     pub connections: usize,
+    pub downloaded: usize,
 }
 
 static counter: AtomicU64 = AtomicU64::new(0);
@@ -76,6 +77,7 @@ impl Fetcher {
             connections: connections.unwrap_or(num_cpus::get()),
             url,
             content_size: 0,
+            downloaded: 0,
         }
     }
 }
@@ -149,10 +151,12 @@ impl Fetcher {
             handlers.push(handler);
         }
 
+        drop(tx);
+
         // write data to file
         let output_path = self.output_path.clone().unwrap().clone();
         let file_size = self.content_size.clone();
-
+        let download_size = self.downloaded.clone();
 
         let write_handler = thread::spawn(move || {
             let mut file = create_fixed_size_file(output_path, file_size).unwrap();
@@ -160,6 +164,9 @@ impl Fetcher {
             let pb = ProgressBar::new(file_size);
             let style = ProgressStyle::default_bar().template("[{elapsed_precise}] {bar:40}  {bytes_per_sec} {percent}% {bytes}").unwrap().progress_chars("##-");
             pb.set_style(style);
+            pb.set_position(download_size as u64);
+            pb.reset_eta();
+
 
             for info in rx {
                 let write_size = match file.write_at(&info.data, info.offset) {
@@ -172,31 +179,17 @@ impl Fetcher {
 
                 pb.inc(write_size as u64);
             }
+
+            pb.position()
         });
 
-
-        // thread::spawn(move || {
-        //     let pb = ProgressBar::new(content_size);
-        //     let style = ProgressStyle::default_bar().template("[{elapsed_precise}] {bar:40}  {bytes_per_sec} {percent}% {bytes}").unwrap().progress_chars("##-");
-        //     pb.set_style(style);
-        //
-        //
-        //     let mut last_progress = 0;
-        //     loop {
-        //         let new = counter.load(Ordering::Relaxed);
-        //         let delta = new - last_progress;
-        //         pb.inc(delta);
-        //         last_progress = new;
-        //         thread::sleep_ms(100)
-        //     }
-        // });
-
+        self.chunks.clear();
         for handler in handlers {
             let chunk = handler.join().unwrap().unwrap();
             self.chunks.push(chunk);
         }
 
-        // write_handler.join();
+        self.downloaded = write_handler.join().unwrap() as usize;
 
         for x in &self.chunks {
             if x.state != ChunkState::Completed {
@@ -272,7 +265,7 @@ struct WriteInfo {
 }
 
 
-fn extract_filename_from_url(url: &str) -> Option<String> {
+pub fn extract_filename_from_url(url: &str) -> Option<String> {
     // Parse the URL
     let parsed_url = Url::parse(url).ok()?;
 
