@@ -5,8 +5,9 @@ use std::io::{Error, Read};
 use std::ops::{Deref, Index};
 use std::os::unix::prelude::FileExt;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, mpsc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, SyncSender};
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, trace};
@@ -14,8 +15,9 @@ use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE}
 use reqwest::{StatusCode, Url};
 use threadpool::ThreadPool;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub enum ChunkState {
     WaitStart,
     Downloading,
@@ -23,7 +25,7 @@ pub enum ChunkState {
     Completed,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub struct Chunk {
     pub state: ChunkState,
     pub begin: u64,
@@ -44,8 +46,8 @@ impl Chunk {
     }
 }
 
-
-enum FetcherState {
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FetcherState {
     WaitStart,
     Downloading,
     Paused,
@@ -53,30 +55,27 @@ enum FetcherState {
     Failed,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fetcher {
-    state: FetcherState,
-    chunks: Vec<Arc<Mutex<Chunk>>>,
-    output_path: Option<String>,
-    file: Option<Arc<Mutex<File>>>,
-    url: String,
-    connections: usize,
-    share_data: Arc<Mutex<SharedData>>,
-    downloaded_count: AtomicU64,
+    pub state: FetcherState,
+    pub chunks: Vec<Chunk>,
+    pub output_path: Option<String>,
+    pub content_size: u64,
+    pub url: String,
+    pub connections: usize,
 }
 
 static counter: AtomicU64 = AtomicU64::new(0);
 
 impl Fetcher {
-    pub fn new(url: String, output: Option<String>, connections: Option<usize>, share_data: Arc<Mutex<SharedData>>) -> Fetcher {
+    pub fn new(url: String, output: Option<String>, connections: Option<usize>) -> Fetcher {
         Fetcher {
             state: FetcherState::WaitStart,
             chunks: vec![],
             output_path: output,
             connections: connections.unwrap_or(num_cpus::get()),
             url,
-            file: None,
-            share_data: share_data,
-            downloaded_count: AtomicU64::new(0),
+            content_size: 0,
         }
     }
 }
@@ -92,12 +91,12 @@ impl Fetcher {
             .to_str().unwrap().parse::<u64>().unwrap();
 
         // check support chunk
-        if result.status().as_u16() == 206 || result.headers().get(ACCEPT_RANGES).unwrap().to_str().unwrap().contains("bytes") {
+        if result.status().is_success() && result.headers().get(ACCEPT_RANGES).unwrap().to_str().unwrap().contains("bytes") {
             for x in split_chunk(content_size, 16).into_iter() {
-                self.chunks.push(Arc::new(Mutex::new(x)));
+                self.chunks.push(x);
             }
         } else {
-            self.chunks.push(Arc::new(Mutex::new(Chunk::new(0, content_size - 1))));
+            self.chunks.push(Chunk::new(0, content_size - 1));
         }
 
         let mut fileName = String::new();
@@ -124,69 +123,97 @@ impl Fetcher {
             }
         }
 
-        let mut file = File::create(fileName).unwrap();
-        let _ = file.set_len(content_size);
+        self.output_path = Some(fileName.clone());
 
-        self.file = Some(Arc::new(Mutex::new(file)));
+        self.content_size = content_size;
 
         Ok(())
     }
 
 
-    pub fn start_download(&self) {
+    pub fn start_download(&mut self, share_data: Arc<Mutex<SharedData>>) {
+        self.state = FetcherState::Downloading;
+
+        let (tx, rx) = mpsc::channel();
         let mut handlers = vec![];
-        for i in 0..self.chunks.len() {
+
+        // fetch chunk
+        for chunk in self.chunks.to_vec() {
             let url = self.url.clone();
-            let output = self.file.clone().unwrap().clone();
-            let chunk = self.chunks[i].clone();
-            let share_data = self.share_data.clone();
-            let handler = thread::spawn(|| {
-                fetch_chunk(chunk, url, output, share_data);
+            let share_data = share_data.clone();
+            let sender = tx.clone();
+            let handler = thread::spawn(move || {
+                fetch_chunk(sender, chunk, url, share_data)
             });
 
             handlers.push(handler);
         }
 
-        let mut content_size = 0;
-        {
-            content_size = self.file.clone().unwrap().lock().unwrap().metadata().unwrap().len();
-        }
+        // write data to file
+        let output_path = self.output_path.clone().unwrap().clone();
+        let file_size = self.content_size.clone();
 
-        thread::spawn(move || {
-            let pb = ProgressBar::new(content_size);
+
+        let write_handler = thread::spawn(move || {
+            let mut file = create_fixed_size_file(output_path, file_size).unwrap();
+
+            let pb = ProgressBar::new(file_size);
             let style = ProgressStyle::default_bar().template("[{elapsed_precise}] {bar:40}  {bytes_per_sec} {percent}% {bytes}").unwrap().progress_chars("##-");
             pb.set_style(style);
 
+            for info in rx {
+                let write_size = match file.write_at(&info.data, info.offset) {
+                    Ok(size) => size,
+                    Err(err) => {
+                        debug!("{}",err);
+                        0
+                    }
+                };
 
-            let mut last_progress = 0;
-            loop {
-                let new = counter.load(Ordering::Relaxed);
-                let delta = new - last_progress;
-                pb.inc(delta);
-                last_progress = new;
-                thread::sleep_ms(100)
+                pb.inc(write_size as u64);
             }
         });
 
-        for handler in handlers {
-            handler.join().unwrap();
-        }
-    }
 
-    pub fn stop(&self) {
-        let mut data = self.share_data.lock().unwrap();
-        data.exit_flag = true;
+        // thread::spawn(move || {
+        //     let pb = ProgressBar::new(content_size);
+        //     let style = ProgressStyle::default_bar().template("[{elapsed_precise}] {bar:40}  {bytes_per_sec} {percent}% {bytes}").unwrap().progress_chars("##-");
+        //     pb.set_style(style);
+        //
+        //
+        //     let mut last_progress = 0;
+        //     loop {
+        //         let new = counter.load(Ordering::Relaxed);
+        //         let delta = new - last_progress;
+        //         pb.inc(delta);
+        //         last_progress = new;
+        //         thread::sleep_ms(100)
+        //     }
+        // });
+
+        for handler in handlers {
+            let chunk = handler.join().unwrap().unwrap();
+            self.chunks.push(chunk);
+        }
+
+        // write_handler.join();
+
+        for x in &self.chunks {
+            if x.state != ChunkState::Completed {
+                self.state = FetcherState::Paused;
+                break;
+            }
+        }
     }
 }
 
-fn fetch_chunk(chunk: Arc<Mutex<Chunk>>, url: String, output: Arc<Mutex<File>>, share_data: Arc<Mutex<SharedData>>) -> Result<(), Error> {
-    let mut chunk = chunk.lock().unwrap();
-
+fn fetch_chunk(tx: Sender<WriteInfo>, mut chunk: Chunk, url: String, share_data: Arc<Mutex<SharedData>>) -> Result<Chunk, Error> {
     if chunk.state == ChunkState::Completed {
-        return Ok(());
+        return Ok(chunk);
     }
 
     let client = reqwest::blocking::Client::new();
+
     // Try five times if there some thing wrong
     for i in 0..5 {
         let request = client.get(&url).header(RANGE, format!("bytes={}-{}", chunk.begin + chunk.downloaded, chunk.end));
@@ -198,7 +225,6 @@ fn fetch_chunk(chunk: Arc<Mutex<Chunk>>, url: String, output: Arc<Mutex<File>>, 
 
         // crate buffer
         let mut buffer = vec![0; 4096];
-        let file = &mut output.lock().unwrap();
         loop {
             let offset = match result.read(&mut buffer) {
                 Ok(offset) => offset,
@@ -209,18 +235,21 @@ fn fetch_chunk(chunk: Arc<Mutex<Chunk>>, url: String, output: Arc<Mutex<File>>, 
                 break;
             }
 
-            let wirte_result = file.write_at(&buffer[0..offset], chunk.begin + chunk.downloaded);
-            if wirte_result.is_err() {
-                break;
+            let send_result = tx.send(WriteInfo {
+                offset: chunk.begin + chunk.downloaded,
+                data: buffer[..offset].to_vec(),
+            });
+
+            if send_result.is_err() {
+                println!("{:#?}", send_result.err().unwrap())
             }
 
-            debug!("wirte {} bytes to file", wirte_result.unwrap());
+
             chunk.downloaded += offset as u64;
-            counter.fetch_add(offset as u64, Ordering::Relaxed);
 
             let data = share_data.lock().unwrap();
             if data.exit_flag {
-                return Ok(());
+                return Ok(chunk);
             }
         }
 
@@ -233,7 +262,13 @@ fn fetch_chunk(chunk: Arc<Mutex<Chunk>>, url: String, output: Arc<Mutex<File>>, 
         }
     }
 
-    Ok(())
+    Ok(chunk)
+}
+
+#[derive(Debug)]
+struct WriteInfo {
+    offset: u64,
+    data: Vec<u8>,
 }
 
 
@@ -312,9 +347,10 @@ mod test {
 
     #[test]
     fn test_download() {
-        let mut fetcher = Fetcher::new("https://okg-pub-hk.oss-cn-hongkong.aliyuncs.com/cdn/okbc/snapshot/testnet-s0-20230720-2995040-rocksdb.tar.gz'".to_string(),
-                                       None, None, Arc::new(Mutex::new(SharedData { exit_flag: false })));
+        let mut fetcher = Fetcher::new("https://okg-pub-hk.oss-cn-hongkong.aliyuncs.com/cdn/okbc/snapshot/testnet-s0-20230720-2995040-rocksdb.tar.gz".to_string(),
+                                       None, None);
+        let shared_data = Arc::new(Mutex::new(SharedData { exit_flag: false }));
         let result = fetcher.resolve();
-        fetcher.start_download();
+        fetcher.start_download(shared_data);
     }
 }
