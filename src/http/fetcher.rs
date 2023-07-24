@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{debug, trace};
+use log::{debug, error, trace};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE};
 use reqwest::{StatusCode, Url};
 use threadpool::ThreadPool;
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub enum ChunkState {
     WaitStart,
     Downloading,
-    Stop,
+    Pause,
     Completed,
 }
 
@@ -191,6 +191,7 @@ impl Fetcher {
 
         self.downloaded = write_handler.join().unwrap() as usize;
 
+        self.state = FetcherState::Completed;
         for x in &self.chunks {
             if x.state != ChunkState::Completed {
                 self.state = FetcherState::Paused;
@@ -207,8 +208,12 @@ fn fetch_chunk(tx: Sender<WriteInfo>, mut chunk: Chunk, url: String, share_data:
 
     let client = reqwest::blocking::Client::new();
 
+
+    chunk.state == ChunkState::Downloading;
+
     // Try five times if there some thing wrong
     for i in 0..5 {
+        // send get request
         let request = client.get(&url).header(RANGE, format!("bytes={}-{}", chunk.begin + chunk.downloaded, chunk.end));
         let mut result = request.send().unwrap();
         if !result.status().is_success() {
@@ -218,37 +223,44 @@ fn fetch_chunk(tx: Sender<WriteInfo>, mut chunk: Chunk, url: String, share_data:
 
         // crate buffer
         let mut buffer = vec![0; 4096];
+
+        // loop reading data
         loop {
             let offset = match result.read(&mut buffer) {
                 Ok(offset) => offset,
                 Err(_) => 0 as usize
             };
 
+            // read EOF
             if offset == 0 {
                 break;
             }
 
+            // send data to write
             let send_result = tx.send(WriteInfo {
                 offset: chunk.begin + chunk.downloaded,
                 data: buffer[..offset].to_vec(),
             });
 
             if send_result.is_err() {
-                println!("{:#?}", send_result.err().unwrap())
+                error!("{:#?}", send_result.err().unwrap())
             }
 
-
+            // inc progress
             chunk.downloaded += offset as u64;
 
-            let data = share_data.lock().unwrap();
-            if data.exit_flag {
-                return Ok(chunk);
+            // check pause signal
+            if let data = share_data.lock().unwrap() {
+                if data.exit_flag {
+                    chunk.state == ChunkState::Pause;
+                    return Ok(chunk);
+                }
             }
         }
 
-        // Check chunk
+        // Check if chunk is completed
         if chunk.end - chunk.begin + 1 == chunk.downloaded {
-            println!("chunk {:?} download completed", &chunk);
+            debug!("chunk {:?} download completed", &chunk);
 
             chunk.state = ChunkState::Completed;
             break;

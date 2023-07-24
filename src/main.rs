@@ -3,8 +3,9 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::mpsc::channel;
-use std::thread;
+use std::{fs, thread};
 use clap::Parser;
+use log::info;
 use reqwest::Error;
 use xget::http;
 use xget::http::fetcher;
@@ -20,8 +21,8 @@ fn main() {
     let url = cli.url.clone() + ".tmp";
 
     let file = extract_filename_from_url(&url).unwrap();
-    if Path::new(file.as_str()).exists() {
-        let file = File::open(file).unwrap();
+    if Path::new(&file).exists() {
+        let file = File::open(&file).unwrap();
         let reader = BufReader::new(file);
         fetcher = serde_json::from_reader(reader).unwrap();
     }else {
@@ -41,10 +42,7 @@ fn main() {
         let (tx, rx) = channel();
         ctrlc::set_handler(move || tx.send(()).expect("Could not send signal on channel."))
             .expect("Error setting Ctrl-C handler");
-
-        println!("Waiting for Ctrl-C...");
         rx.recv().expect("Could not receive from channel.");
-        println!("Got it! Exiting...");
         let mut data = share_data.lock().unwrap();
         data.exit_flag = true;
     });
@@ -52,9 +50,21 @@ fn main() {
 
     fetcher.start_download(shared_data.clone());
 
-    if fetcher.state == FetcherState::Paused {
-        let mut temp_file = File::create(fetcher.output_path.clone().unwrap() + ".tmp").unwrap();
-        serde_json::to_writer(&temp_file, &fetcher);
+    match fetcher.state {
+        FetcherState::Paused => {
+            let mut temp_file = File::create(fetcher.output_path.clone().unwrap() + ".tmp").unwrap();
+            serde_json::to_writer(&temp_file, &fetcher);
+        },
+
+        FetcherState::Completed => {
+            if Path::new(&file).exists() {
+                fs::remove_file(&file);
+            }
+
+            println!("Completed download!: save file to {}.", &fetcher.output_path.unwrap())
+        },
+        _ => {
+        }
     }
 }
 
